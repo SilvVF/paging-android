@@ -22,3 +22,4 @@ dependencyResolutionManagement {
 rootProject.name = "paging4"
 include(":app")
 include(":page4")
+include(":cameraext")

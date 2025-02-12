@@ -60,7 +60,7 @@ private sealed interface PageEvent {
 }
 
 sealed class PagingState<ITEM>(
-    open val items: List<ITEM> = emptyList()
+    open val items: List<ITEM> = emptyList(),
 ) {
 
     sealed class Refreshing<ITEM> : PagingState<ITEM>(items = emptyList()) {
@@ -128,25 +128,51 @@ class Pager<KEY : Comparable<*>, ITEM>(
         var prevEvent = lastEvent.value
 
         lastEvent.collectLatest { event ->
-
-            val pages = pages.snapshot().toSortedMap(compareBy { it }).map { (key, results) ->
-                List(results.getOrDefault(emptyList()).size) { index: Int ->
-                    ItemWrapper(
-                        key = key,
-                        offset = index,
-                        this@Pager
-                    )
+            try {
+                if (event is PageEvent.Refresh) {
+                    pages.evictAll()
+                    startFetchingPage(requireNotNull(getNextKey(null)))
                 }
+
+                val pages = pages.snapshot().toSortedMap(compareBy { it }).map { (key, results) ->
+                    List(results.getOrDefault(emptyList()).size) { index: Int ->
+                        ItemWrapper(
+                            key = key,
+                            offset = index,
+                            this@Pager
+                        )
+                    }
+                }
+                    .flatten()
+
+                Log.d(LOG_TAG, "PAGES RECEIVED: count=${pages.size}")
+
+                send(getNextState(prevEvent, event.also { prevEvent = it }, pages))
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                Log.d(LOG_TAG, "ERROR: failed to handle page event $event")
             }
-                .flatten()
-
-            Log.d(LOG_TAG, "PAGES RECEIVED: count=${pages.size}")
-
-            send(getNextState(prevEvent, event.also { prevEvent = it }, pages))
         }
     }
 
-    fun checkLoadNext(key: KEY, offset: Int) {
+    fun retry(page: KEY? = null) {
+        scope.launch {
+            startFetchingPage(
+                page ?: pages.snapshot()
+                    .toSortedMap(compareBy { it })
+                    .lastKey()
+            )
+        }
+    }
+
+    fun refresh() {
+        scope.launch {
+            lastEvent.emit(PageEvent.Refresh)
+        }
+    }
+
+    internal fun checkLoadNext(key: KEY, offset: Int) {
         scope.launch {
             mutex.withLock {
                 val page = pages[key]?.getOrNull() ?: return@launch
@@ -159,10 +185,22 @@ class Pager<KEY : Comparable<*>, ITEM>(
                 )
                 if (left == 0) {
                     val next = getNextKey(key) ?: return@launch
+                    if (pages[next]?.isFailure == true) {
+                        Log.d(LOG_TAG, "AWAITING USER RETRY $next")
+                        return@launch
+                    }
                     Log.d(LOG_TAG, "LOADING NEXT $next")
-                    startFetchingPage(next)
+                    if (pages[next] == null) {
+                        startFetchingPage(next)
+                    }
                 } else if (page.lastIndex - offset + config.prefetchDistance >= page.lastIndex) {
                     val prev = getPrevKey(key) ?: return@launch
+
+                    if (pages[prev]?.isFailure == true) {
+                        Log.d(LOG_TAG, "AWAITING USER RETRY $prev")
+                        return@launch
+                    }
+
                     Log.d(LOG_TAG, "LOADING PREV: $prev")
                     if (pages[prev] == null) {
                         startFetchingPage(prev)
@@ -206,7 +244,8 @@ class Pager<KEY : Comparable<*>, ITEM>(
                 running[key] = scope.launch {
                     Log.d(LOG_TAG, "FETCHING PAGE: $key")
                     try {
-                        pages.put(key, getNextPage(key))
+                        val result = getNextPage(key).getOrThrow()
+                        pages.put(key, Result.success(result))
                         Log.d("FETCHED SUCCESSFULLY", key.toString())
                         times[key] = mark.elapsedNow()
                         lastEvent.update { PageEvent.Loaded(key) }
