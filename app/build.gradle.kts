@@ -62,4 +62,8 @@ dependencies {
 
     implementation("io.ktor:ktor-client-core:3.0.3")
     implementation("io.ktor:ktor-client-cio:3.0.3")
+
+    val nav_version = "2.8.7"
+
+    implementation("androidx.navigation:navigation-compose:$nav_version")
 }
