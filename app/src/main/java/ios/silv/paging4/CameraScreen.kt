@@ -2,6 +2,7 @@ package ios.silv.paging4
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
@@ -14,6 +15,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -27,8 +29,30 @@ import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavController
+import io.ktor.network.selector.ActorSelectorManager
+import io.ktor.network.selector.SelectorManager
+import io.ktor.network.sockets.InetSocketAddress
+import io.ktor.network.sockets.aSocket
+import io.ktor.network.sockets.openWriteChannel
+import io.ktor.utils.io.flushIfNeeded
+import io.ktor.utils.io.writeByte
+import io.ktor.utils.io.writeByteArray
+import io.ktor.utils.io.writeString
+import io.ktor.utils.io.writeStringUtf8
 import ios.silv.cameraext.CameraComposeView
 import ios.silv.cameraext.rememberCameraState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.consumeAsFlow
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.time.withTimeout
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 const val CAMERA_SCREEN_ROUTE = "camera_screen"
 
@@ -40,6 +64,47 @@ private val requiredPermission = arrayOf(
     Manifest.permission.CAMERA,
     Manifest.permission.RECORD_AUDIO
 )
+
+private const val HOST = "10.0.2.2"
+private const val PORT = 9002
+
+object NetTcp {
+
+    private val selectorManager = ActorSelectorManager(Dispatchers.IO)
+
+    val frameCh = Channel<ByteArray>(
+        capacity = 10,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
+    @OptIn(DelicateCoroutinesApi::class)
+    fun run() = GlobalScope.launch(Dispatchers.IO) {
+        Log.d("TCP", "starting tcp conn")
+        try {
+            val socket = withTimeout(5000) {
+                aSocket(selectorManager).tcp().connect(InetSocketAddress(HOST, PORT)) {
+                    noDelay = true
+                    keepAlive = true
+                }
+            }
+            socket.use { sock ->
+                Log.d("TCP", "connected")
+                val sendChannel = sock.openWriteChannel(autoFlush = true)
+
+                frameCh.receiveAsFlow().collect { frame ->
+                    Log.i("TCP", "sending frame ${frame.size}")
+                    sendChannel.writeByteArray(frame)
+                    // TODO: this is for testing the go server expects this as the end of a line
+                    sendChannel.writeString("\n")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("TCP", e.stackTraceToString())
+            if (e is CancellationException) throw e
+        }
+    }
+}
+
 
 @Composable
 fun CameraScreen(navController: NavController) {
@@ -95,7 +160,14 @@ fun CameraScreen(navController: NavController) {
 private fun CameraViewActivityLifecycle(
     modifier: Modifier = Modifier
 ) {
-    val cameraState = rememberCameraState()
+    val cameraState = rememberCameraState(NetTcp.frameCh)
+
+    LaunchedEffect(Unit) {
+        NetTcp.frameCh.receiveAsFlow().collect {
+            Log.d("MainActivity.kt", "Received a frame size: ${it.size}")
+        }
+    }
+
 
     CameraComposeView(
         modifier = modifier.fillMaxSize(),
@@ -125,8 +197,13 @@ private fun CameraViewCustomLifecycle(
         }
     }
 
+    val cameraState = rememberCameraState(lifecycleOwner, NetTcp.frameCh)
 
-    val cameraState = rememberCameraState(lifecycleOwner)
+    LaunchedEffect(Unit) {
+        NetTcp.frameCh.receiveAsFlow().collect {
+            Log.d("MainActivity.kt", "Received a frame size: ${it.size}")
+        }
+    }
 
     CompositionLocalProvider(LocalLifecycleOwner provides lifecycleOwner) {
         CameraComposeView(

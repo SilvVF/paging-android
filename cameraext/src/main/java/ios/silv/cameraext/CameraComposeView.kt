@@ -2,21 +2,21 @@ package ios.silv.cameraext
 
 import android.content.Context
 import android.content.ContextWrapper
-import android.media.ImageReader
 import android.media.MediaCodec
+import android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM
 import android.media.MediaCodec.BufferInfo
+import android.media.MediaCodec.CONFIGURE_FLAG_ENCODE
+import android.media.MediaCodec.INFO_TRY_AGAIN_LATER
+import android.media.MediaCodec.createEncoderByType
 import android.media.MediaCodecInfo
-import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.util.Log
 import androidx.activity.ComponentActivity
-import androidx.annotation.RestrictTo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.DynamicRange
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
-import androidx.camera.core.SurfaceRequest
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -24,7 +24,6 @@ import androidx.camera.lifecycle.awaitInstance
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
-import androidx.camera.video.VideoCapture
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -45,6 +44,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -58,11 +58,14 @@ import androidx.lifecycle.LifecycleCoroutineScope
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.SendChannel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
-import java.util.concurrent.Executor
-import java.util.concurrent.Executors
 
 private const val TAG = "CameraComposeView.kt"
 
@@ -148,7 +151,8 @@ sealed interface CameraUiEvent {
     data class ChangeCamera(val idx: Int) : CameraUiEvent
 }
 
-private val VIDEO_AVC = "video/avc"
+private const val VIDEO_AVC = "video/avc"
+private const val CODEC_TIMEOUT_US = 10000L
 private val defaultMediaFormatBuilder: MediaFormat.() -> Unit = {
     setInteger(
         MediaFormat.KEY_COLOR_FORMAT,
@@ -160,18 +164,21 @@ private val defaultMediaFormatBuilder: MediaFormat.() -> Unit = {
 }
 
 private fun createEncoder(
-    flags: Int = 0,
+    width: Int = 1920,
+    height: Int = 1080,
+    flags: Int = CONFIGURE_FLAG_ENCODE,
+    mimeType: String = VIDEO_AVC,
     builder: MediaFormat.() -> Unit = defaultMediaFormatBuilder
 ): MediaCodec {
     // https://en.wikipedia.org/wiki/Advanced_Video_Coding
-    return MediaCodec.createEncoderByType(VIDEO_AVC).apply {
+    return createEncoderByType(mimeType).apply {
         configure(
             MediaFormat
-                .createVideoFormat(VIDEO_AVC, 1920, 1080)
+                .createVideoFormat(mimeType, width, height)
                 .apply(builder),
             /*surface =*/null,
             /*crypto =*/ null,
-            /*flags =*/flags or MediaCodec.CONFIGURE_FLAG_ENCODE
+            /*flags =*/flags
         )
     }
 }
@@ -194,12 +201,13 @@ private fun ImageProxy.toNV21(): ByteArray {
     return nv21
 }
 
-private fun MediaCodec.encodeFrame(executor: Executor, yuvData: ByteArray, saveEncodedData: (encodedFrame: ByteArray) -> Unit) {
-    val inputBufferIndex = dequeueInputBuffer(10000)
+// https://stuff.mit.edu/afs/sipb/project/android/docs/reference/android/media/MediaCodec.html
+private fun MediaCodec.encodeFrame(yuvData: ByteArray) {
+    val inputBufferIndex = dequeueInputBuffer(CODEC_TIMEOUT_US)
     if (inputBufferIndex >= 0) {
-        val inputBuffer = getInputBuffer(inputBufferIndex)
-        inputBuffer?.clear()
-        inputBuffer?.put(yuvData)
+        val inputBuffer = getInputBuffer(inputBufferIndex) ?: return
+        inputBuffer.clear()
+        inputBuffer.put(yuvData)
         queueInputBuffer(
             /*index */ inputBufferIndex,
             /*offset*/0,
@@ -208,19 +216,40 @@ private fun MediaCodec.encodeFrame(executor: Executor, yuvData: ByteArray, saveE
             /*flags*/0
         )
     }
+}
+
+// https://github.com/lykhonis/MediaCodec/blob/master/app/src/main/java/com/vladli/android/mediacodec/VideoEncoder.java
+private suspend fun MediaCodec.listenForEncodedFrames(frameCh: SendChannel<ByteArray>) = coroutineScope {
     val bufferInfo = BufferInfo()
-    executor.execute {
-        var outputBufferIndex = dequeueOutputBuffer(bufferInfo, 10000)
-        while (outputBufferIndex >= 0) {
-            val outputBuffer = getOutputBuffer(outputBufferIndex)
-            val outData = ByteArray(bufferInfo.size)
-            outputBuffer?.get(outData)
+    while(true) {
+        try {
+            val status = dequeueOutputBuffer(bufferInfo, CODEC_TIMEOUT_US)
+            when {
+                status == INFO_TRY_AGAIN_LATER -> {
+                    ensureActive()
+                    delay(1)
+                }
+                status > 0 -> {
+                    val outputBuffer = getOutputBuffer(status) ?: continue
+                    val outData = ByteArray(bufferInfo.size)
+                    outputBuffer.get(outData)
+                    val eos = bufferInfo.flags and BUFFER_FLAG_END_OF_STREAM == BUFFER_FLAG_END_OF_STREAM
 
-            // Process H.264 encoded frame
-            saveEncodedData(outData)
+                    if (!eos) {
+                        val result = frameCh.trySend(outData)
+                        Log.i(TAG, "tried sending frame: $status success: ${result.isSuccess}")
+                    }
+                    releaseOutputBuffer(status, false)
 
-            releaseOutputBuffer(outputBufferIndex, false)
-            outputBufferIndex = dequeueOutputBuffer(bufferInfo, 10000)
+                    if (eos) {
+                        signalEndOfInputStream()
+                        frameCh.close()
+                        break
+                    }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
         }
     }
 }
@@ -228,15 +257,13 @@ private fun MediaCodec.encodeFrame(executor: Executor, yuvData: ByteArray, saveE
 class CameraState internal constructor(
     private val context: Context,
     internal val lifecycleOwner: LifecycleOwner,
+    private val frameCh: SendChannel<ByteArray>
 ) {
 
     private val lifecycleScope: LifecycleCoroutineScope = lifecycleOwner.lifecycleScope
     private lateinit var captureView: PreviewView
     private lateinit var cameraProvider: ProcessCameraProvider
     internal val encoder = createEncoder()
-   // private lateinit var videoCapture: VideoCapture<Recorder>
-
-    private val encodingExecutor = Executors.newSingleThreadExecutor()
 
     var deferredCapabilities: Deferred<Unit>? = null
 
@@ -252,6 +279,10 @@ class CameraState internal constructor(
         deferredCapabilities = loadCameraCapabilities(lifecycleOwner, context) { capabilities ->
             cameraCapabilities.add(capabilities)
         }
+    }
+
+    internal fun startFrameListener() = lifecycleScope.launch {
+        encoder.listenForEncodedFrames(frameCh)
     }
 
     internal suspend fun bindCaptureUseCase(previewView: PreviewView) {
@@ -277,8 +308,6 @@ class CameraState internal constructor(
                 Log.d(TAG, "Set surfaceProvider")
                 surfaceProvider = previewView.surfaceProvider
             }
-        // val recorder = Recorder.Builder().setQualitySelector(qualitySelector).build()
-        // videoCapture = VideoCapture.withOutput(recorder)
 
         // https://developer.android.com/media/camera/camerax/analyze#operating-modes
         val analyzer = ImageAnalysis.Builder()
@@ -292,9 +321,7 @@ class CameraState internal constructor(
                 "received a frame h:${imageProxy.height}, w:${imageProxy.width}, r:${rotationDegrees}"
             )
             val nv21 = imageProxy.toNV21()
-            encoder.encodeFrame(encodingExecutor, nv21) { encoded ->
-                Log.d(TAG, encoded.decodeToString())
-            }
+            encoder.encodeFrame(nv21)
             imageProxy.close()
         }
 
@@ -349,23 +376,32 @@ class CameraState internal constructor(
 
 
 @Composable
-fun rememberCameraState(): CameraState {
+fun rememberCameraState(
+    frameCh: SendChannel<ByteArray>
+): CameraState {
 
     val context = LocalContext.activityContext()
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    return remember(context, lifecycleOwner) {
-        CameraState(context, lifecycleOwner)
+    val chan by rememberUpdatedState(frameCh)
+
+    return remember(context, lifecycleOwner, frameCh) {
+        CameraState(context, lifecycleOwner, chan)
     }
 }
 
 @Composable
-fun rememberCameraState(lifecycleOwner: LifecycleOwner): CameraState {
+fun rememberCameraState(
+    lifecycleOwner: LifecycleOwner,
+    frameCh: SendChannel<ByteArray>,
+): CameraState {
 
     val context = LocalContext.activityContext()
 
+    val chan by rememberUpdatedState(frameCh)
+
     return remember(context, lifecycleOwner) {
-        CameraState(context, lifecycleOwner)
+        CameraState(context, lifecycleOwner, chan)
     }
 }
 
@@ -374,9 +410,14 @@ fun CameraComposeView(
     modifier: Modifier = Modifier,
     cameraState: CameraState
 ) {
-    DisposableEffect(Unit) {
+    DisposableEffect(cameraState) {
         cameraState.encoder.start()
-        onDispose { cameraState.encoder.stop() }
+        val job = cameraState.startFrameListener()
+        onDispose {
+            job.cancel()
+            cameraState.encoder.stop()
+            cameraState.encoder.release()
+        }
     }
 
     Box(
